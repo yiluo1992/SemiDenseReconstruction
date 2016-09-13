@@ -18,6 +18,8 @@ using namespace std;
 // Esimate Depth From Epipolar Constraint
 void depthFromSparseMatch();
 void searchEpipolarLine();
+void buildDepthMapandDispaly();
+void fuseMultipleFrames();
 
 #endif // DEPTHESTIMATION
 

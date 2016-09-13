@@ -21,6 +21,7 @@ using namespace std;
 // OpenCV
 #include <core/core.hpp>
 #include <highgui/highgui.hpp>
+#include <imgproc/imgproc.hpp>
 #include <calib3d/calib3d.hpp>
 #include <nonfree/nonfree.hpp>
 #include <core/eigen.hpp>
@@ -47,7 +48,7 @@ struct CAMERA_INTRINSIC_PARAMETERS
 struct FRAME
 {
     int frameID; 
-    cv::Mat rgb, depth; //该帧对应的彩色图与深度图
+    cv::Mat rgb, depth, gray; //该帧对应的彩色图与深度图
     cv::Mat desp;       //特征描述子
     vector<cv::KeyPoint> kp; //关键点
 };
@@ -57,6 +58,9 @@ struct RESULT_OF_PNP
 {
     cv::Mat rvec, tvec;
     int inliers;
+    // min and max depth of key points that used for tracking
+    float minDepth;
+    float maxDepth;
 };
 
 // 函数接口
@@ -137,6 +141,23 @@ inline static CAMERA_INTRINSIC_PARAMETERS getDefaultCamera()
     camera.cy = atof( pd.getData( "camera.cy" ).c_str());
     camera.scale = atof( pd.getData( "camera.scale" ).c_str() );
     return camera;
+}
+
+inline FRAME readFrame(int index)
+{
+    FRAME f;
+    stringstream ss;
+    ss<<index;
+    string filename;
+    ss>>filename;
+
+    f.rgb = cv::imread("./rgb" + filename + ".png");
+    f.depth = cv::imread("./depth" + filename + ".png", -1);
+    cvtColor(f.rgb, f.gray, CV_RGB2GRAY);
+
+    cout << "Reading frame no." << filename << endl;
+
+    return f;
 }
 
 // Some Sample Function

@@ -88,11 +88,14 @@ RESULT_OF_PNP estimateMotion( FRAME& frame1, FRAME& frame2, CAMERA_INTRINSIC_PAR
     vector< cv::DMatch > matches;
     cv::FlannBasedMatcher matcher;
     matcher.match( frame1.desp, frame2.desp, matches );
-   
+    cout<<"Find total "<<matches.size()<<" matches."<<endl;
+
     RESULT_OF_PNP result;
+    // 筛选匹配，把距离太大的去掉
+    // 这里使用的准则是去掉大于四倍最小距离的匹配
+    //double good_match_threshold = atof( pd.getData( "good_match_threshold" ).c_str() );
     vector< cv::DMatch > goodMatches;
     double minDis = 9999;
-    double good_match_threshold = atof( pd.getData( "good_match_threshold" ).c_str() );
     for ( size_t i=0; i<matches.size(); i++ )
     {
         if ( matches[i].distance < minDis )
@@ -101,10 +104,9 @@ RESULT_OF_PNP estimateMotion( FRAME& frame1, FRAME& frame2, CAMERA_INTRINSIC_PAR
 
     for ( size_t i=0; i<matches.size(); i++ )
     {
-        if (matches[i].distance < good_match_threshold*minDis)
+        if (matches[i].distance < 4*minDis)
             goodMatches.push_back( matches[i] );
     }
-
 
     if (goodMatches.size() <= 5) 
     {
@@ -116,7 +118,11 @@ RESULT_OF_PNP estimateMotion( FRAME& frame1, FRAME& frame2, CAMERA_INTRINSIC_PAR
     // 第二个帧的图像点
     vector< cv::Point2f > pts_img;
 
-    // 相机内参
+    // filter out those invalid point, depth is 0
+    vector< cv::DMatch > filteredGoodMatches;
+    // keep track of the mindepth and maxdepth
+    float minDepth = FLT_MAX;
+    float maxDepth = FLT_MIN;
     for (size_t i=0; i<goodMatches.size(); i++)
     {
         // query 是第一个, train 是第二个
@@ -125,12 +131,18 @@ RESULT_OF_PNP estimateMotion( FRAME& frame1, FRAME& frame2, CAMERA_INTRINSIC_PAR
         ushort d = frame1.depth.ptr<ushort>( int(p.y) )[ int(p.x) ];
         if (d == 0)
             continue;
+
+        float curDepth = (float)d/camera.scale;
+        if(minDepth > curDepth) minDepth = curDepth;
+        if(maxDepth < curDepth) maxDepth = curDepth;
+
         pts_img.push_back( cv::Point2f( frame2.kp[goodMatches[i].trainIdx].pt ) );
 
         // 将(u,v,d)转成(x,y,z)
         cv::Point3f pt ( p.x, p.y, d );
         cv::Point3f pd = point2dTo3d( pt, camera );
         pts_obj.push_back( pd );
+        filteredGoodMatches.push_back(goodMatches[i]);
     }
 
     if (pts_obj.size() ==0 || pts_img.size()==0)
@@ -149,11 +161,13 @@ RESULT_OF_PNP estimateMotion( FRAME& frame1, FRAME& frame2, CAMERA_INTRINSIC_PAR
     cv::Mat cameraMatrix( 3, 3, CV_64F, camera_matrix_data );
     cv::Mat rvec, tvec, inliers;
     // 求解pnp
-    cv::solvePnPRansac( pts_obj, pts_img, cameraMatrix, cv::Mat(), rvec, tvec, false, 100, 1.0, 100, inliers );
+    cv::solvePnPRansac( pts_obj, pts_img, cameraMatrix, cv::Mat(), rvec, tvec, false, 100, 0.5, 100, inliers );
 
     result.rvec = rvec;
     result.tvec = tvec;
     result.inliers = inliers.rows;
+    result.minDepth = minDepth;
+    result.maxDepth = maxDepth;
 
     return result;
 }

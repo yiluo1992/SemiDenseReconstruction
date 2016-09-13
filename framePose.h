@@ -5,7 +5,9 @@
 #include "so3.hpp"
 #include "se3.hpp"
 #include "sim3.hpp"
+#include "sophus.hpp"
 #include "sophusUtil.h"
+#include "tests.hpp"
 
 class FramePose
 {

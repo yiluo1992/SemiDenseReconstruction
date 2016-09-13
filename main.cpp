@@ -2,11 +2,15 @@
 #include "depthEstimation.h"
 #include "slamBase.h"
 
-int main()
+int main(int argc, char *argv[])
 {
     //detectFeature();
     //generatePointCloud();
     //depthFromSparseMatch();
-    searchEpipolarLine();
+    //searchEpipolarLine();
+    //buildDepthMapandDispaly();
+    fuseMultipleFrames();
     return 0;
 }
+
+

@@ -21,7 +21,11 @@ DepthMap::DepthMap(int w, int h, const Eigen::Matrix3f& K, const cv::Mat _keyFra
     keyFrameImage = _keyFramImage.clone();
     keyFrameImageData = (float*) keyFrameImage.data;
     keyFrameGradientsValid = false;
+    keyFrameGradients = new Eigen::Vector4f[width*height];
+    keyFrameMaxGradients = new float[width*height];
+
     buildGradients();
+    buildMaxGradients();
 
 //    cout << keyFrameImage.row(20);
 //    cv::Mat imgShow;
@@ -33,14 +37,12 @@ DepthMap::DepthMap(int w, int h, const Eigen::Matrix3f& K, const cv::Mat _keyFra
 DepthMap::~DepthMap()
 {
     delete[] currentDepthMap;
-
-    if(keyFrameGradientsValid)
-        delete[] keyFrameGradients;
+    delete[] keyFrameGradients;
+    delete[] keyFrameMaxGradients;
 }
 
 void DepthMap::buildGradients()
 {
-    keyFrameGradients = new Eigen::Vector4f[width*height];
     const float* img_pt = keyFrameImageData + width;
     const float* img_pt_max = keyFrameImageData + width*(height-1);
     Eigen::Vector4f* gradxyii_pt = keyFrameGradients + width;
@@ -63,9 +65,124 @@ void DepthMap::buildGradients()
     keyFrameGradientsValid = true;
 }
 
-int DepthMap::doLineStereo(
+void DepthMap::buildMaxGradients()
+{
+    float* maxGradTemp = new float[width*height];
+
+    // 1. write abs gradients in real data.
+    Eigen::Vector4f* gradxyii_pt = keyFrameGradients + width;
+    float* maxgrad_pt = keyFrameMaxGradients + width;
+    float* maxgrad_pt_max = keyFrameMaxGradients + width*(height-1);
+
+    for(; maxgrad_pt < maxgrad_pt_max; maxgrad_pt++, gradxyii_pt++)
+    {
+        float dx = *((float*)gradxyii_pt);
+        float dy = *(1+(float*)gradxyii_pt);
+        *maxgrad_pt = sqrtf(dx*dx + dy*dy);
+    }
+
+    // 2. smear up/down direction into temp buffer
+    maxgrad_pt = keyFrameMaxGradients + width+1;
+    maxgrad_pt_max = keyFrameMaxGradients + width*(height-1)-1;
+    float* maxgrad_t_pt = maxGradTemp + width+1;
+    for(;maxgrad_pt<maxgrad_pt_max; maxgrad_pt++, maxgrad_t_pt++)
+    {
+        float g1 = maxgrad_pt[-width];
+        float g2 = maxgrad_pt[0];
+        if(g1 < g2) g1 = g2;
+        float g3 = maxgrad_pt[width];
+        if(g1 < g3)
+            *maxgrad_t_pt = g3;
+        else
+            *maxgrad_t_pt = g1;
+    }
+
+    float numMappablePixels = 0;
+    // 2. smear left/right direction into real data
+    maxgrad_pt = keyFrameMaxGradients + width+1;
+    maxgrad_pt_max = keyFrameMaxGradients + width*(height-1)-1;
+    maxgrad_t_pt = maxGradTemp + width+1;
+    for(;maxgrad_pt<maxgrad_pt_max; maxgrad_pt++, maxgrad_t_pt++)
+    {
+        float g1 = maxgrad_t_pt[-1];
+        float g2 = maxgrad_t_pt[0];
+        if(g1 < g2) g1 = g2;
+        float g3 = maxgrad_t_pt[1];
+        if(g1 < g3)
+        {
+            *maxgrad_pt = g3;
+            if(g3 >= MIN_ABS_GRAD_CREATE)
+                numMappablePixels++;
+        }
+        else
+        {
+            *maxgrad_pt = g1;
+            if(g1 >= MIN_ABS_GRAD_CREATE)
+                numMappablePixels++;
+        }
+    }
+    cout << "number of mappable pixel: " << numMappablePixels << endl;
+    delete [] maxGradTemp;
+}
+
+bool DepthMap::makeAndCheckEPL(const int x, const int y, const FramePose& ref, float* pepx, float* pepy)
+{
+    int idx = x+y*width;
+
+    // ======= make epl ========
+    // calculate the plane spanned by the two camera centers and the point (x,y,1)
+    // intersect it with the keyframe's image plane (at depth=1)
+    float epx = - fx * ref.thisToOther_t[0] + ref.thisToOther_t[2]*(x - cx);
+    float epy = - fy * ref.thisToOther_t[1] + ref.thisToOther_t[2]*(y - cy);
+
+    if(isnanf(epx+epy))
+        return false;
+
+
+    // ======== check epl length =========
+    float eplLengthSquared = epx*epx+epy*epy;
+    if(eplLengthSquared < MIN_EPL_LENGTH_SQUARED)
+    {
+        //if(enablePrintDebugInfo) stats->num_observe_skipped_small_epl++;
+        //return false;
+        cout << "EPL len too short!" << endl;
+        return false;
+    }
+
+    // ===== check epl-grad magnitude ======
+    float gx = keyFrameImageData[idx+1] - keyFrameImageData[idx-1];
+    float gy = keyFrameImageData[idx+width] - keyFrameImageData[idx-width];
+    float eplGradSquared = gx * epx + gy * epy;
+    eplGradSquared = eplGradSquared*eplGradSquared / eplLengthSquared;	// square and norm with epl-length
+
+    if(eplGradSquared < MIN_EPL_GRAD_SQUARED)
+    {
+        //if(enablePrintDebugInfo) stats->num_observe_skipped_small_epl_grad++;
+        cout << "EPL grad magnitude too small!" << endl;
+        return false;
+    }
+
+
+    // ===== check epl-grad angle ======
+    if(eplGradSquared / (gx*gx+gy*gy) < MIN_EPL_ANGLE_SQUARED)
+    {
+        //if(enablePrintDebugInfo) stats->num_observe_skipped_small_epl_angle++;
+        cout << "EPL grad angle too small!" << endl;
+        return false;
+    }
+
+
+    // ===== DONE - return "normalized" epl =====
+    float fac = GRADIENT_SAMPLE_DIST / sqrt(eplLengthSquared);
+    *pepx = epx * fac;
+    *pepy = epy * fac;
+
+    return true;
+}
+
+float DepthMap::doLineStereo(
         const float u, const float v, const float epxn, const float epyn,
-        const float min_idepth, const float prior_idepth, float max_idepth,
+        float min_idepth, float prior_idepth, float max_idepth,
         FramePose& referenceFrame, const float* referenceFrameImage,
         float &result_idepth, float &result_var, float &result_eplLength)
 {
@@ -139,6 +256,7 @@ int DepthMap::doLineStereo(
 
     if(eplLength > MAX_EPL_LENGTH_CROP)
     {
+        cout << "Excced the MAX EPL LEN CRO.P\n";
         pClose[0] = pFar[0] + incx*MAX_EPL_LENGTH_CROP/eplLength;
         pClose[1] = pFar[1] + incy*MAX_EPL_LENGTH_CROP/eplLength;
     }
@@ -365,22 +483,22 @@ int DepthMap::doLineStereo(
         loopCounter++;
     }
 
-    cout << "Found Point: " << best_match_x << ", " << best_match_y << " With Error: " << best_match_err << endl;
+    //if error too big, will return -3, otherwise -2.
+    if(best_match_err > 4.0f*(float)MAX_ERROR_STEREO)
+    {
+        //if(enablePrintDebugInfo) stats->num_stereo_invalid_bigErr++;
+        cout << "Error too large. " << endl;
+        return -3;
+    }
 
-    // if error too big, will return -3, otherwise -2.
-//    if(best_match_err > 4.0f*(float)MAX_ERROR_STEREO)
-//    {
-//        //if(enablePrintDebugInfo) stats->num_stereo_invalid_bigErr++;
-//        return -3;
-//    }
 
-
-//    // check if clear enough winner
-//    if(abs(loopCBest - loopCSecond) > 1.0f && MIN_DISTANCE_ERROR_STEREO * best_match_err > second_best_match_err)
-//    {
-//        //if(enablePrintDebugInfo) stats->num_stereo_invalid_unclear_winner++;
-//        return -2;
-//    }
+    // check if clear enough winner
+    if(abs(loopCBest - loopCSecond) > 1.0f && MIN_DISTANCE_ERROR_STEREO * best_match_err > second_best_match_err)
+    {
+        //if(enablePrintDebugInfo) stats->num_stereo_invalid_unclear_winner++;
+        cout << "Not Unique." << endl;
+        return -2;
+    }
 
     bool didSubpixel = false;
     bool useSubpixelStereo = true;
@@ -468,6 +586,8 @@ int DepthMap::doLineStereo(
         }
     }
 
+    //cout << "Found Point: " << best_match_x << ", " << best_match_y << " With Error: " << best_match_err << endl;
+
     // sampleDist is the distance in pixel at which the realVal's were sampled
     float sampleDist = GRADIENT_SAMPLE_DIST*rescaleFactor;
 
@@ -480,11 +600,12 @@ int DepthMap::doLineStereo(
     gradAlongLine /= sampleDist*sampleDist;
 
     // check if interpolated error is OK. use evil hack to allow more error if there is a lot of gradient.
-    //if(best_match_err > (float)MAX_ERROR_STEREO + sqrtf( gradAlongLine)*20)
-    //{
+    if(best_match_err > (float)MAX_ERROR_STEREO + sqrtf( gradAlongLine)*20)
+    {
         //if(enablePrintDebugInfo) stats->num_stereo_invalid_bigErr++;
-    //    return -3;
-    //}
+        cout << "Error too large. " << endl;
+        return -3;
+    }
 
     // ================= calc depth (in KF) ====================
     // * KinvP = Kinv * (x,y,1); where x,y are pixel coordinates of point we search for, in the KF.
@@ -546,5 +667,264 @@ int DepthMap::doLineStereo(
     // geometric and photometric error.
     result_var = alpha*alpha*((didSubpixel ? 0.05f : 0.5f)*sampleDist*sampleDist +  geoDispError + photoDispError);	// square to make variance
 
-    return -1;
+    return best_match_err;
 }
+
+void DepthMap::buildDepthMap(float min_idepth, float prior_idepth, float max_idepth,
+                             FramePose& referenceFrame, const float* referenceFrameImage)
+{
+    int numSuccess = 0;
+    int numSearchTry = 0;
+    for(int y=3;y<height-3; y++)
+    {
+        for(int x=3;x<width-3;x++)
+        {
+            int idx = x+y*width;
+            DepthMapPixelHypothesis* target = currentDepthMap+idx;
+            // set invalid first
+            target->isValid = false;
+            if(*(keyFrameMaxGradients + idx) < MIN_ABS_GRAD_CREATE)
+            {
+                //cout << "MaxGradient too small!" << endl;
+                continue;
+            }
+            bool success = observeDepthCreate(x, y, idx,
+                               min_idepth, prior_idepth, max_idepth,
+                               referenceFrame, referenceFrameImage);
+            numSearchTry++;
+            if(success)
+            {
+                target->isValid = true;
+                numSuccess++;
+            }
+
+        }
+    }
+    cout << "Total " << numSearchTry << " search tried!\n";
+    cout << "Total " << numSuccess << " point's depth have been estimated!\n";
+}
+
+void DepthMap::updateDepthMap(float min_idepth, float prior_idepth, float max_idepth,
+                             FramePose& referenceFrame, const float* referenceFrameImage)
+{
+    int numSuccess = 0;
+    int numSearchTry = 0;
+    for(int y=3;y<height-3; y++)
+    {
+        for(int x=3;x<width-3;x++)
+        {
+            int idx = x+y*width;
+            DepthMapPixelHypothesis* target = currentDepthMap+idx;
+            // set invalid first
+            target->isValid = false;
+            if(*(keyFrameMaxGradients + idx) < MIN_ABS_GRAD_CREATE)
+            {
+                //cout << "MaxGradient too small!" << endl;
+                continue;
+            }
+            bool success = observeDepthUpdate(x, y, idx,
+                               min_idepth, prior_idepth, max_idepth,
+                               referenceFrame, referenceFrameImage);
+            numSearchTry++;
+            if(success)
+            {
+                target->isValid = true;
+                numSuccess++;
+            }
+
+        }
+    }
+    cout << "Total " << numSearchTry << " search tried!\n";
+    cout << "Total " << numSuccess << " point's depth have been updated!\n";
+}
+
+bool DepthMap::observeDepthCreate(const int &x, const int &y, const int &idx,
+                                  float min_idepth, float prior_idepth, float max_idepth,
+                                  FramePose& referenceFrame, const float* referenceFrameImage)
+{
+    DepthMapPixelHypothesis* target = currentDepthMap+idx;
+
+    float epx, epy;
+    bool isGood = makeAndCheckEPL(x, y, referenceFrame, &epx, &epy);
+    if(!isGood) return false;
+
+    float u_p = x;
+    float v_p = y;
+    float estimatedInverseDepth, estimatedVar, estimatedEplLen;
+
+    float error = doLineStereo(u_p, v_p, epx, epy,
+                        min_idepth, prior_idepth, max_idepth,
+                        referenceFrame, referenceFrameImage,
+                        estimatedInverseDepth, estimatedVar, estimatedEplLen);
+
+    // check if error
+    if(error == -3 || error == -2)
+        return false;
+    if(error < 0)
+        return false;
+    estimatedInverseDepth = UNZERO(estimatedInverseDepth);
+
+    // add hypothesis
+    *target = DepthMapPixelHypothesis(
+            estimatedInverseDepth,
+            estimatedVar,
+            VALIDITY_COUNTER_INITIAL_OBSERVE);
+
+    return true;
+}
+
+bool DepthMap::observeDepthUpdate(const int &x, const int &y, const int &idx,
+                                  float min_idepth, float prior_idepth, float max_idepth,
+                                  FramePose& referenceFrame, const float* referenceFrameImage)
+{
+    DepthMapPixelHypothesis* target = currentDepthMap+idx;
+
+    float epx, epy;
+    bool isGood = makeAndCheckEPL(x, y, referenceFrame, &epx, &epy);
+    if(!isGood) return false;
+
+    float u_p = x;
+    float v_p = y;
+    float estimatedInverseDepth, estimatedVar, estimatedEplLen;
+
+    float error = doLineStereo(u_p, v_p, epx, epy,
+                        min_idepth, prior_idepth, max_idepth,
+                        referenceFrame, referenceFrameImage,
+                        estimatedInverseDepth, estimatedVar, estimatedEplLen);
+
+    // check if error
+    if(error == -3 || error == -2)
+        return false;
+    if(error < 0)
+        return false;
+    estimatedInverseDepth = UNZERO(estimatedInverseDepth);
+
+    // update hypothesis
+    if(abs(1.0/target->idepth - 1.0/estimatedInverseDepth) < 0.5)
+    {
+        target->idepth = (target->idepth + estimatedInverseDepth)/2;
+        target->idepth_var = (target->idepth_var + estimatedVar)/2;
+    }
+    else
+        return false;
+
+    return true;
+}
+
+void DepthMap::regularizeDepthMap()
+{
+    const int regularize_radius = 2;
+    const float regDistVar = REG_DIST_VAR;
+    for(int y=3;y<height-3; y++)
+    {
+        for(int x=3;x<width-3;x++)
+        {
+            DepthMapPixelHypothesis* destRead = currentDepthMap + x + y*width;
+            if(!destRead->isValid)
+            {
+                continue;
+            }
+
+            float sum=0, val_sum=0, sumIvar=0;//, min_varObs = 1e20;
+            for(int dx=-regularize_radius; dx<=regularize_radius;dx++)
+            {
+                for(int dy=-regularize_radius; dy<=regularize_radius;dy++)
+                {
+                    DepthMapPixelHypothesis* source = destRead + dx + dy*width;
+
+                    if(!source->isValid) continue;
+
+                    float diff =source->idepth - destRead->idepth;
+                    if(DIFF_FAC_SMOOTHING*diff*diff > source->idepth_var + destRead->idepth_var)
+                    {
+                        //if(removeOcclusions)
+                        //{
+                        //    if(source->idepth > destRead->idepth)
+                        //        numOccluding++;
+                        //}
+                        continue;
+                    }
+
+                    //val_sum += source->validity_counter;
+                    //if(removeOcclusions)
+                    //    numNotOccluding++;
+
+                    float distFac = (float)(dx*dx+dy*dy)*regDistVar;
+                    float ivar = 1.0f/(source->idepth_var + distFac);
+
+                    sum += source->idepth * ivar;
+                    sumIvar += ivar;
+                }
+            }
+            sum = sum / sumIvar;
+            sum = UNZERO(sum);
+            destRead->idepth_smoothed = sum;
+            destRead->idepth_var_smoothed = 1.0f/sumIvar;
+        }
+    }
+    cout << "Regularization Done!\n";
+}
+
+void DepthMap::showDepthMap(float min_idepth, float max_idepth)
+{
+    float maxDepth = 1.0/min_idepth;
+    float minDepth = 1.0/max_idepth;
+    float depthRange = maxDepth - minDepth;
+    cv::Mat depthMap(height, width, CV_8U, cv::Scalar(0));
+    for(int y=3;y<height-3; y++)
+    {
+        for(int x=3;x<width-3;x++)
+        {
+            int idx = x+y*width;
+            DepthMapPixelHypothesis* target = currentDepthMap+idx;
+            if(target->isValid)
+            {
+                float curDepth = 1.0/target->idepth_smoothed;
+                depthMap.at<uchar>(y, x) = int(255*(curDepth-minDepth)/depthRange);
+                //cout << (int)depthMap.at<uchar>(y, x) << endl;
+            }
+        }
+    }
+    cv::imshow("Depth Map", depthMap);
+    cv::waitKey();
+}
+
+void DepthMap::savePointCloud(cv::Mat& referenceFrameImage)
+{
+    PointCloud::Ptr cloud (new PointCloud);
+    for(int y=3;y<height-3; y++)
+    {
+        for(int x=3;x<width-3;x++)
+        {
+            int idx = x+y*width;
+            DepthMapPixelHypothesis* target = currentDepthMap+idx;
+            if(target->isValid)
+            {
+                float d = 1.0/target->idepth_smoothed;
+                // d 存在值，则向点云增加一个点
+                PointT p;
+                // 计算这个点的空间坐标
+                p.z = double(d);
+                p.x = (x - cx) * p.z / fx;
+                p.y = (y - cy) * p.z / fy;
+                // 从rgb图像中获取它的颜色
+                // rgb是三通道的BGR格式图，所以按下面的顺序获取颜色
+                p.b = referenceFrameImage.ptr<uchar>(y)[x*3];
+                p.g = referenceFrameImage.ptr<uchar>(y)[x*3+1];
+                p.r = referenceFrameImage.ptr<uchar>(y)[x*3+2];
+                // 把p加入到点云中
+                cloud->points.push_back( p );
+            }
+        }
+    }
+    // 设置并保存点云
+    cloud->height = 1;
+    cloud->width = cloud->points.size();
+    cout<<"point cloud size = "<<cloud->points.size()<<endl;
+    cloud->is_dense = false;
+    pcl::io::savePCDFile( "./pointcloud.pcd", *cloud );
+    // 清除数据并退出
+    cloud->points.clear();
+
+}
+
